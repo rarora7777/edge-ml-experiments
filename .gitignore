@@ -1,0 +1,60 @@
+# Local data collection directories
+data/
+*.csv
+
+# Python virtual environments and packages
+venv/
+.venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python bytecode/caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and Editor local settings
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*~
+
+# Arduino IDE / ESP32 build and sketch artifacts
+/firmware/build/
+/firmware/libraries/
+*.bin
+*.elf
+*.hex
+
+# PlatformIO build directories
+.pio/
+
+# OS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
