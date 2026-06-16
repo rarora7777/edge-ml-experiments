@@ -2,6 +2,8 @@
 
 This project enables real-time streaming of IMU (accelerometer + gyroscope) data from an **M5Stack M5StickC series** device (M5StickC, M5StickC Plus, or M5StickC Plus2) to a computer over **Bluetooth Low Energy (BLE)**. It uses C++ (`M5Unified` + `M5GFX`) for the device firmware and Python (`Bleak`) for the data receiver.
 
+The repo is now standardized on **Python 3.12** via [.python-version](file:///Users/rarora/dev/imu_tests/.python-version), and the top-level [requirements.txt](file:///Users/rarora/dev/imu_tests/requirements.txt) includes the training, BLE client, and TensorFlow Lite conversion stack.
+
 The primary objective is to collect annotated training data for a PyTorch Machine Learning model. Specifically, it allows you to press a button on the M5StickC to toggle between two activity classes:
 1. **Walking with the device in hand** (Label: `0`)
 2. **Walking with the device in pocket** (Label: `1`)
@@ -87,16 +89,13 @@ The binary unpacking is executed in Python by the [parse_packet](file:///Users/r
 ### 1. Python Environment Setup
 We recommend creating a virtual environment to isolate dependencies:
 ```bash
-# Navigate to the client directory
-cd client
+# From the repo root, create the standard Python 3.12 environment
+python3.12 -m venv .venv
 
-# Create a virtual environment
-python3 -m venv venv
+# Activate it
+source .venv/bin/activate
 
-# Activate the virtual environment
-source venv/bin/activate
-
-# Install dependencies (bleak)
+# Install the full project stack
 pip install -r requirements.txt
 ```
 
@@ -151,3 +150,57 @@ When you're ready to proceed to PyTorch, you will use these CSV records to train
    - *Raw Signals*: Feed the 6-axis signals ($125 \times 6$) directly into a 1D Convolutional Neural Network.
    - *Engineered Features*: Extract statistical summaries (mean, variance, peak-to-peak, main frequencies from Fast Fourier Transform) per window and feed them into a Multi-Layer Perceptron.
 4. **Train/Val/Test Split**: Ensure you split entire *sessions* rather than individual windows to prevent data leakage (a user's walking signature is highly correlated within a single session).
+
+---
+
+## Quantized TFLite Flow
+
+The notebook exports the trained model to ONNX as [training/imu_classifier_1dcnn.onnx](file:///Users/rarora/dev/imu_tests/training/imu_classifier_1dcnn.onnx). The conversion path in this repo rebuilds the same CNN in Keras from the ONNX weights, quantizes it to **int8 TFLite**, validates it on the computer, and then emits Arduino headers for the ESP32 firmware.
+
+### 1. Build the int8 TFLite model
+```bash
+source .venv/bin/activate
+python training/convert_to_tflite.py
+```
+
+This writes:
+- `training/artifacts/imu_classifier_1dcnn.int8.tflite`
+- `training/artifacts/imu_classifier_1dcnn.keras`
+- `training/artifacts/imu_classifier_1dcnn_normalization.npz`
+- `training/artifacts/imu_classifier_1dcnn.int8.json`
+
+### 2. Validate it on the computer
+```bash
+python training/validate_tflite.py
+```
+
+The validator compares ONNX and TFLite predictions on the held-out validation windows derived from the CSV sessions in `data/`.
+
+### 3. Generate firmware model assets
+```bash
+python training/export_firmware_assets.py
+```
+
+That updates:
+- `firmware/m5stickc_imu_ble/imu_model_data.h`
+- `firmware/m5stickc_imu_ble/imu_model_config.h`
+
+### 4. Flash and use eval mode on the device
+
+The firmware sketch now has two runtime modes:
+- **Stream mode**: existing BLE data collection flow.
+- **Eval mode**: runs the quantized TFLite model on-device over a rolling 100-sample IMU window.
+
+Controls:
+- **Button A**
+  - Stream mode: cycle through the data collection label states.
+  - Eval mode: reset the rolling inference window.
+- **Button B**
+  - Toggle between Stream mode and Eval mode.
+
+For Arduino IDE:
+1. Install the usual `M5Unified` / `M5GFX` dependencies.
+2. Install **Chirale_TensorFlowLite** (`spaziochirale/Chirale_TensorFlowLite`), which provides `TensorFlowLite.h` and the `tensorflow/lite/micro/...` headers expected by the sketch.
+3. Re-open and upload [firmware/m5stickc_imu_ble/m5stickc_imu_ble.ino](file:///Users/rarora/dev/imu_tests/firmware/m5stickc_imu_ble/m5stickc_imu_ble.ino).
+
+If the Chirale TensorFlow Lite Micro library is missing, the sketch still builds the BLE collection path, but eval mode will report `NO TFLM` on-screen.

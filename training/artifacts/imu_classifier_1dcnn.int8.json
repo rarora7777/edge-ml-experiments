@@ -1,0 +1,37 @@
+{
+  "class_labels": [
+    "hand",
+    "pocket"
+  ],
+  "input_name": "serving_default_imu_signal:0",
+  "input_shape": [
+    1,
+    100,
+    6
+  ],
+  "input_dtype": "<class 'numpy.int8'>",
+  "input_quantization": {
+    "scale": 0.07509051263332367,
+    "zero_point": 23
+  },
+  "output_name": "StatefulPartitionedCall_1:0",
+  "output_shape": [
+    1,
+    2
+  ],
+  "output_dtype": "<class 'numpy.int8'>",
+  "output_quantization": {
+    "scale": 0.15595212578773499,
+    "zero_point": -2
+  },
+  "normalization_path": "/Users/rarora/dev/imu_tests/training/artifacts/imu_classifier_1dcnn_normalization.npz",
+  "keras_path": "/Users/rarora/dev/imu_tests/training/artifacts/imu_classifier_1dcnn.keras",
+  "representative_sample_count": 108,
+  "validation_window_count": 28,
+  "tflite_size_bytes": 269344,
+  "sanity_logits_shape": [
+    8,
+    2
+  ],
+  "keras_vs_onnx_mae_first8": 3.725290298461914e-07
+}
