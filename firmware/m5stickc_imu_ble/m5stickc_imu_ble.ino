@@ -3,22 +3,19 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <math.h>
+#include <stdarg.h>
 
 #include "imu_model_config.h"
 #include "imu_model_data.h"
 
-#if __has_include(<Chirale_TensorFlowLite.h>)
-#define HAS_TFLM 1
 #include <Chirale_TensorFlowLite.h>
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/version.h"
-#else
-#define HAS_TFLM 0
-#endif
 
 // Custom BLE UUIDs (matching the client script)
 #define SERVICE_UUID           "23a00000-0df2-432d-a23e-63f59e9a1122"
@@ -81,7 +78,9 @@ AppMode lastAppMode = APP_STREAM;
 unsigned long stateTransitionTime = 0;
 const unsigned long startDelay = 1000;
 unsigned long lastSampleTime = 0;
+unsigned long lastEvalTime = 0;
 const unsigned long sampleInterval = 20;
+const unsigned long evalInterval = 200;
 unsigned long lastDisplayTime = 0;
 const unsigned long displayInterval = 100;
 
@@ -95,8 +94,8 @@ bool evalRuntimeReady = false;
 bool evalModelPresent = false;
 bool evalInferenceOkay = false;
 const char* evalStatus = "NO MODEL";
+uint16_t lastEvalBgColor = COLOR_BLACK;
 
-#if HAS_TFLM
 namespace {
 const tflite::Model* gModel = nullptr;
 tflite::MicroMutableOpResolver<9> gResolver;
@@ -105,7 +104,26 @@ TfLiteTensor* gInputTensor = nullptr;
 TfLiteTensor* gOutputTensor = nullptr;
 uint8_t* gTensorArena = nullptr;
 }
-#endif
+
+namespace {
+uint32_t gBootCount = 0;
+constexpr bool kDebugSkipInitialDisplay = false;
+}
+
+void logDebug(const char* message) {
+  Serial.println(message);
+  Serial.flush();
+}
+
+void logDebugf(const char* fmt, ...) {
+  char buffer[160];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  Serial.println(buffer);
+  Serial.flush();
+}
 
 void setLed(bool turnOn) {
   auto board = M5.getBoard();
@@ -256,8 +274,8 @@ void updateStreamDisplay(VisualState state) {
 }
 
 void drawEvalLayout() {
-  uint16_t bgColor = evalRuntimeReady ? COLOR_BLUE : COLOR_RED;
-  uint16_t textColor = COLOR_WHITE;
+  uint16_t bgColor = lastEvalBgColor;
+  uint16_t textColor = (bgColor == COLOR_YELLOW) ? COLOR_BLACK : COLOR_WHITE;
 
   M5.Display.fillScreen(bgColor);
   M5.Display.setTextColor(textColor, bgColor);
@@ -271,9 +289,30 @@ void drawEvalLayout() {
   M5.Display.drawString("Inf :", 8, 81);
 }
 
+uint16_t currentEvalBackgroundColor() {
+  if (!evalRuntimeReady) {
+    return COLOR_RED;
+  }
+  if (evalSampleCount < kImuModelWindowSize) {
+    return COLOR_BLUE;
+  }
+  if (!evalInferenceOkay || evalPrediction < 0) {
+    return COLOR_RED;
+  }
+  if (evalConfidence < 0.60f) {
+    return COLOR_YELLOW;
+  }
+  return (evalPrediction == 0) ? COLOR_GREEN : COLOR_ORANGE;
+}
+
 void updateEvalDisplay() {
-  uint16_t bgColor = evalRuntimeReady ? COLOR_BLUE : COLOR_RED;
-  uint16_t textColor = COLOR_WHITE;
+  uint16_t bgColor = currentEvalBackgroundColor();
+  uint16_t textColor = (bgColor == COLOR_YELLOW) ? COLOR_BLACK : COLOR_WHITE;
+
+  if (bgColor != lastEvalBgColor) {
+    lastEvalBgColor = bgColor;
+    drawEvalLayout();
+  }
 
   M5.Display.setTextSize(1.1);
   M5.Display.setTextColor(textColor, bgColor);
@@ -312,18 +351,22 @@ void switchAppMode(AppMode newMode) {
     packetCount = 0;
   } else {
     resetEvalState();
+    lastEvalBgColor = currentEvalBackgroundColor();
   }
 }
 
 void setupEvalRuntime() {
+  logDebug("setupEvalRuntime: begin");
   evalModelPresent = kImuModelAvailable && g_imu_model_tflite_len > 0;
+  logDebugf("setupEvalRuntime: model_present=%d model_len=%u", evalModelPresent ? 1 : 0, (unsigned)g_imu_model_tflite_len);
   if (!evalModelPresent) {
     evalStatus = "NO MODEL";
     evalRuntimeReady = false;
+    logDebug("setupEvalRuntime: no model");
     return;
   }
 
-#if HAS_TFLM
+  logDebug("setupEvalRuntime: registering ops");
   gResolver.AddExpandDims();
   gResolver.AddConv2D();
   gResolver.AddReshape();
@@ -334,24 +377,32 @@ void setupEvalRuntime() {
   gResolver.AddPack();
   gResolver.AddFullyConnected();
 
+  logDebug("setupEvalRuntime: parsing model");
   gModel = tflite::GetModel(g_imu_model_tflite);
   if (gModel->version() != TFLITE_SCHEMA_VERSION) {
     evalStatus = "SCHEMA ERR";
     evalRuntimeReady = false;
+    logDebugf("setupEvalRuntime: schema mismatch model=%d expected=%d", gModel->version(), TFLITE_SCHEMA_VERSION);
     return;
   }
 
-  gTensorArena = new uint8_t[kImuTensorArenaSize];
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  logDebugf("setupEvalRuntime: allocating arena bytes=%u free_heap=%u max_alloc=%u", (unsigned)kImuTensorArenaSize, (unsigned)ESP.getFreeHeap(), (unsigned)largestBlock);
+  gTensorArena = static_cast<uint8_t*>(heap_caps_malloc(kImuTensorArenaSize, MALLOC_CAP_8BIT));
   if (gTensorArena == nullptr) {
     evalStatus = "ARENA FAIL";
     evalRuntimeReady = false;
+    logDebugf("setupEvalRuntime: arena allocation failed max_alloc=%u", (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     return;
   }
+  logDebugf("setupEvalRuntime: arena_ptr=%p free_heap=%u", gTensorArena, (unsigned)ESP.getFreeHeap());
 
+  logDebug("setupEvalRuntime: creating interpreter");
   gInterpreter = new tflite::MicroInterpreter(gModel, gResolver, gTensorArena, kImuTensorArenaSize);
   if (gInterpreter == nullptr || gInterpreter->AllocateTensors() != kTfLiteOk) {
     evalStatus = "ALLOC FAIL";
     evalRuntimeReady = false;
+    logDebugf("setupEvalRuntime: AllocateTensors failed interpreter=%p free_heap=%u", gInterpreter, (unsigned)ESP.getFreeHeap());
     return;
   }
 
@@ -360,15 +411,13 @@ void setupEvalRuntime() {
   if (gInputTensor == nullptr || gOutputTensor == nullptr || gInputTensor->type != kTfLiteInt8 || gOutputTensor->type != kTfLiteInt8) {
     evalStatus = "INT8 ONLY";
     evalRuntimeReady = false;
+    logDebugf("setupEvalRuntime: tensor type mismatch in=%d out=%d", gInputTensor ? gInputTensor->type : -1, gOutputTensor ? gOutputTensor->type : -1);
     return;
   }
 
   evalStatus = "READY";
   evalRuntimeReady = true;
-#else
-  evalStatus = "NO TFLM";
-  evalRuntimeReady = false;
-#endif
+  logDebugf("setupEvalRuntime: ready input_bytes=%d output_bytes=%d free_heap=%u", gInputTensor->bytes, gOutputTensor->bytes, (unsigned)ESP.getFreeHeap());
 }
 
 void appendEvalSample(float ax, float ay, float az, float gx, float gy, float gz) {
@@ -390,7 +439,6 @@ void appendEvalSample(float ax, float ay, float az, float gx, float gy, float gz
   }
 }
 
-#if HAS_TFLM
 int8_t quantizeInputValue(float rawValue, int featureIdx) {
   float normalized = (rawValue - kImuModelMean[featureIdx]) / kImuModelStd[featureIdx];
   int quantized = (int)lrintf(normalized / kImuModelInputScale) + kImuModelInputZeroPoint;
@@ -432,6 +480,7 @@ bool runEvalInference() {
   if (gInterpreter->Invoke() != kTfLiteOk) {
     evalStatus = "INFER FAIL";
     evalInferenceOkay = false;
+    logDebug("runEvalInference: invoke failed");
     return false;
   }
 
@@ -456,25 +505,47 @@ bool runEvalInference() {
   evalInferenceOkay = true;
   return true;
 }
-#endif
+
 
 void setup() {
+  Serial.begin(115200);
+  delay(250);
+  ++gBootCount;
+  logDebug("");
+  logDebug("==== boot ====");
+  logDebugf("boot_count=%u reset_reason=%d free_heap=%u", (unsigned)gBootCount, (int)esp_reset_reason(), (unsigned)ESP.getFreeHeap());
+
+  logDebug("setup: M5.begin start");
   auto cfg = M5.config();
   M5.begin(cfg);
-  M5.Display.setRotation(3);
-  drawStreamLayout(currentVisualState);
+  logDebugf("setup: M5.begin done free_heap=%u", (unsigned)ESP.getFreeHeap());
+  logDebug("setup: before display rotation");
+  if (!kDebugSkipInitialDisplay) {
+    M5.Display.setRotation(3);
+    logDebug("setup: display rotation set");
+    logDebug("setup: before initial layout");
+    drawStreamLayout(currentVisualState);
+    logDebug("setup: initial layout drawn");
+  } else {
+    logDebug("setup: initial display skipped");
+  }
 
   if (!M5.Imu.isEnabled()) {
+    logDebug("setup: IMU not found");
     M5.Display.setTextColor(COLOR_RED, COLOR_BLACK);
     M5.Display.drawString("IMU Not Found!", 8, 35);
     while (1) {
       delay(100);
     }
   }
+  logDebug("setup: IMU enabled");
 
   setLed(false);
+  logDebug("setup: LED initialized");
   setupEvalRuntime();
+  logDebugf("setup: eval runtime ready=%d status=%s", evalRuntimeReady ? 1 : 0, evalStatus);
 
+  logDebug("setup: BLE init");
   BLEDevice::init("M5StickC-IMU");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -493,9 +564,12 @@ void setup() {
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
+  logDebug("setup: BLE advertising started");
 
   lastSampleTime = millis();
+  lastEvalTime = millis();
   lastDisplayTime = millis();
+  logDebug("setup: complete");
 }
 
 void loop() {
@@ -518,6 +592,7 @@ void loop() {
       drawStreamLayout(currentVisualState);
       lastVisualState = currentVisualState;
     } else {
+      lastEvalBgColor = currentEvalBackgroundColor();
       drawEvalLayout();
       updateEvalDisplay();
     }
@@ -612,9 +687,11 @@ void loop() {
     if (now - lastSampleTime >= sampleInterval) {
       lastSampleTime = now;
       appendEvalSample(ax, ay, az, gx, gy, gz);
-#if HAS_TFLM
+    }
+
+    if (now - lastEvalTime >= evalInterval) {
+      lastEvalTime = now;
       runEvalInference();
-#endif
     }
 
     if (!evalRuntimeReady) {
