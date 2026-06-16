@@ -63,6 +63,56 @@ The binary unpacking is executed in Python by the [parse_packet](file:///Users/r
 
 ---
 
+## Getting Started: Embedded Firmware (PlatformIO)
+
+This repo now includes a root-level [platformio.ini](/Users/rarora/dev/imu_tests/platformio.ini) that points PlatformIO at the existing Arduino sketch in [firmware/m5stickc_imu_ble/m5stickc_imu_ble.ino](/Users/rarora/dev/imu_tests/firmware/m5stickc_imu_ble/m5stickc_imu_ble.ino). It keeps the Arduino-style source layout and adds the larger app partition needed by the TensorFlow Lite build through [firmware/m5stickc_imu_ble/partitions_huge_app.csv](/Users/rarora/dev/imu_tests/firmware/m5stickc_imu_ble/partitions_huge_app.csv).
+
+### Install PlatformIO
+
+If you do not already have PlatformIO Core:
+
+```bash
+python3 -m pip install -U platformio
+```
+
+Or install the VS Code PlatformIO extension if you prefer the IDE workflow.
+
+### Compile
+
+From the repo root:
+
+```bash
+pio run
+```
+
+That uses the default `m5stickc` environment defined in `platformio.ini`.
+
+### Upload
+
+Connect the board over USB, then run:
+
+```bash
+pio run --target upload
+```
+
+If PlatformIO does not auto-detect the serial port, specify it explicitly:
+
+```bash
+pio run --target upload --upload-port /dev/cu.usbserial-*
+```
+
+### Serial Monitor
+
+```bash
+pio device monitor -b 115200
+```
+
+### Notes
+
+- The configured board target is `m5stick-c`, which is the PlatformIO board ID documented by PlatformIO for the ESP32-based M5Stick-C family.
+- The sketch itself uses `M5Unified`, so display, IMU, and LED handling remain runtime-detected in the firmware.
+- The custom partition file allocates a 3 MB application slot, matching the Arduino IDE advice to use a large-app partition when the TFLite model is enabled.
+
 ## Getting Started: Embedded Firmware (Arduino IDE)
 
 1. Install the Arduino IDE (version 2.x or later is recommended).
