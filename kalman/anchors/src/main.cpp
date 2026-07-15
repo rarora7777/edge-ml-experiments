@@ -11,12 +11,18 @@ namespace {
 constexpr int kUwbRxPin = 33;  // Core2 Port A G33 receives UWB TX.
 constexpr int kUwbTxPin = 32;  // Core2 Port A G32 sends data to UWB RX.
 constexpr uint32_t kUwbBaudRate = 115200;
+constexpr uint32_t kDisplayTimeoutMs = 10000;
 
 HardwareSerial uwbSerial(2);
 char statusText[96] = "Starting";
+bool displayVisible = false;
+uint32_t displayUntilMs = 0;
 
 /** Draws the Core2's current battery percentage in the display header. */
 void showBatteryLevel() {
+    if (!displayVisible) {
+        return;
+    }
     M5.Display.fillRect(222, 8, 90, 24, TFT_DARKGREEN);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREEN);
     M5.Display.setTextSize(0.2);
@@ -48,12 +54,35 @@ void drawAnchorDisplay() {
 
 void showStatus(const char* status) {
     strlcpy(statusText, status, sizeof(statusText));
+    if (!displayVisible) {
+        return;
+    }
     M5.Display.fillRect(12, 198, 296, 30, TFT_DARKGREEN);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREEN);
     M5.Display.setTextSize(0.2);
     M5.Display.setCursor(12, 202);
     M5.Display.print("UWB: ");
     M5.Display.print(statusText);
+}
+
+/** Wakes the Core2 display and keeps its status visible for ten seconds. */
+void wakeAnchorDisplay() {
+    displayUntilMs = millis() + kDisplayTimeoutMs;
+    if (displayVisible) {
+        return;
+    }
+    M5.Display.wakeup();
+    displayVisible = true;
+    drawAnchorDisplay();
+    showStatus(statusText);
+}
+
+/** Powers down the display once its ten-second visibility period expires. */
+void updateAnchorDisplayPower() {
+    if (displayVisible && static_cast<int32_t>(millis() - displayUntilMs) >= 0) {
+        M5.Display.sleep();
+        displayVisible = false;
+    }
 }
 
 void printChipMac() {
@@ -128,7 +157,8 @@ void setup() {
     config.external_imu = false;
     config.external_rtc = false;
     M5.begin(config);
-    drawAnchorDisplay();
+    M5.Display.setBrightness(80);
+    M5.Display.sleep();
     showStatus("Booting");
 
     Serial.printf("UWB anchor station booting with ID %d\n", UWB_ANCHOR_ID);
@@ -141,10 +171,16 @@ void setup() {
 
 void loop() {
     M5.update();
+    const auto touch = M5.Touch.getDetail();
+    if (M5.BtnPWR.wasPressed() || M5.BtnPWR.wasClicked() || touch.wasPressed()) {
+        Serial.println("Display wake request");
+        wakeAnchorDisplay();
+    }
     forwardUwbOutput();
+    updateAnchorDisplayPower();
 
     static uint32_t lastBatteryUpdateMs = 0;
-    if (millis() - lastBatteryUpdateMs >= 10000) {
+    if (displayVisible && millis() - lastBatteryUpdateMs >= 1000) {
         showBatteryLevel();
         lastBatteryUpdateMs = millis();
     }

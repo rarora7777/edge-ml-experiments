@@ -12,6 +12,8 @@
 #include <esp_timer.h>
 
 #include <camera_pins.h>
+#else
+#include <nvs.h>
 #endif
 #include <wifi_credentials.h>
 
@@ -47,17 +49,23 @@ UwbSample uwbHistory[kUwbHistoryLength];
 #if defined(TAG_M5STICKC_PLUS)
 char latestUwbStatus[32] = "Starting";
 uint32_t latestUwbStatusMs = 0;
+constexpr uint32_t kDisplayTimeoutMs = 10000;
+uint32_t stickDisplayUntilMs = 0;
+uint32_t lastStickDisplayDrawMs = 0;
+bool stickDisplayVisible = false;
 #endif
 
 #if defined(TAG_M5STICKC_PLUS)
 constexpr int kImuSdaPin = 21;
 constexpr int kImuSclPin = 22;
+constexpr i2c_port_t kImuI2cPort = I2C_NUM_1;
 constexpr m5::board_t kImuBoard = m5::board_t::board_M5StickCPlus;
 constexpr int kUwbRxPin = 33;  // Port A G33 receives data from the UWB unit.
 constexpr int kUwbTxPin = 32;  // Port A G32 sends commands to the UWB unit.
 #else
 constexpr int kImuSdaPin = IMU_SDA_GPIO_NUM;
 constexpr int kImuSclPin = IMU_SCL_GPIO_NUM;
+constexpr i2c_port_t kImuI2cPort = I2C_NUM_0;
 constexpr m5::board_t kImuBoard = m5::board_t::board_M5AtomS3RCam;
 constexpr int kUwbRxPin = 1;  // Port A G1 receives data from the UWB unit.
 constexpr int kUwbTxPin = 2;  // Port A G2 sends commands to the UWB unit.
@@ -145,9 +153,9 @@ void updateImuTask(void*) {
 
 /** Initializes the IMU on its dedicated I2C bus, then starts its reader task. */
 void initializeImuTask(void*) {
-    log_i("IMU: configuring I2C port 0 on SDA=%d SCL=%d",
-          kImuSdaPin, kImuSclPin);
-    M5.In_I2C.setPort(I2C_NUM_0, kImuSdaPin, kImuSclPin);
+    log_i("IMU: configuring I2C port %d on SDA=%d SCL=%d",
+          static_cast<int>(kImuI2cPort), kImuSdaPin, kImuSclPin);
+    M5.In_I2C.setPort(kImuI2cPort, kImuSdaPin, kImuSclPin);
 
     // IMU_Class::begin() initializes the supplied I2C bus itself.
     log_i("IMU: initializing onboard sensor");
@@ -200,43 +208,82 @@ void storeUwbStatus(const char* report) {
     xSemaphoreGive(uwbMutex);
 }
 
-/** Draws battery level and the latest UWB response once per second. */
-void updateStickDisplayTask(void*) {
-    M5.Display.setRotation(0);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setTextSize(2);
-
-    for (;;) {
-        char uwbStatus[sizeof(latestUwbStatus)];
-        uint32_t statusMs = 0;
-        if (xSemaphoreTake(uwbMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            strlcpy(uwbStatus, latestUwbStatus, sizeof(uwbStatus));
-            statusMs = latestUwbStatusMs;
-            xSemaphoreGive(uwbMutex);
-        } else {
-            strlcpy(uwbStatus, "Busy", sizeof(uwbStatus));
+/** Updates the M5StickC Plus display from the main task that owns M5Unified. */
+void updateStickDisplay() {
+    const uint32_t now = millis();
+    const bool shouldShow = static_cast<int32_t>(stickDisplayUntilMs - now) > 0;
+    if (!shouldShow) {
+        if (stickDisplayVisible) {
+            M5.Display.setBrightness(0);
+            stickDisplayVisible = false;
         }
-
-        M5.Display.fillScreen(TFT_BLACK);
-        M5.Display.setCursor(8, 12);
-        const int32_t batteryLevel = M5.Power.getBatteryLevel();
-        if (batteryLevel >= 0) {
-            M5.Display.printf("BAT %ld%%", static_cast<long>(batteryLevel));
-        } else {
-            M5.Display.print("BAT --");
-        }
-        M5.Display.setCursor(8, 62);
-        M5.Display.print("UWB");
-        M5.Display.setTextSize(1);
-        M5.Display.setCursor(8, 94);
-        if (statusMs == 0 || millis() - statusMs > 5000) {
-            M5.Display.print("Waiting for range");
-        } else {
-            M5.Display.print(uwbStatus);
-        }
-        M5.Display.setTextSize(2);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        return;
     }
+
+    if (!stickDisplayVisible) {
+        M5.Display.setBrightness(200);
+        M5.Display.setRotation(0);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setTextSize(2);
+        stickDisplayVisible = true;
+        lastStickDisplayDrawMs = 0;
+    }
+    if (now - lastStickDisplayDrawMs < 1000) {
+        return;
+    }
+    lastStickDisplayDrawMs = now;
+
+    char uwbStatus[sizeof(latestUwbStatus)];
+    uint32_t statusMs = 0;
+    if (xSemaphoreTake(uwbMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        strlcpy(uwbStatus, latestUwbStatus, sizeof(uwbStatus));
+        statusMs = latestUwbStatusMs;
+        xSemaphoreGive(uwbMutex);
+    } else {
+        strlcpy(uwbStatus, "Busy", sizeof(uwbStatus));
+    }
+
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setCursor(8, 12);
+    const int32_t batteryLevel = M5.Power.getBatteryLevel();
+    if (batteryLevel >= 0) {
+        M5.Display.printf("BAT %ld%%", static_cast<long>(batteryLevel));
+    } else {
+        M5.Display.print("BAT --");
+    }
+    M5.Display.setCursor(8, 62);
+    M5.Display.print("UWB");
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(8, 94);
+    if (statusMs == 0 || millis() - statusMs > 5000) {
+        M5.Display.print("Waiting for range");
+    } else {
+        M5.Display.print(uwbStatus);
+    }
+    M5.Display.setTextSize(2);
+}
+
+/** Keeps the M5StickC Plus display awake for ten seconds after Button A. */
+void wakeStickDisplay() {
+    stickDisplayUntilMs = millis() + kDisplayTimeoutMs;
+}
+
+/** Persists the correct panel type because PlatformIO exposes only m5stick-c. */
+void selectStickCPlusPanel() {
+    nvs_handle_t handle;
+    if (nvs_open("M5GFX", NVS_READWRITE, &handle) != ESP_OK) {
+        log_w("Display: unable to open M5GFX settings");
+        return;
+    }
+
+    const uint32_t board = static_cast<uint32_t>(m5::board_t::board_M5StickCPlus);
+    uint32_t storedBoard = 0;
+    nvs_get_u32(handle, "AUTODETECT", &storedBoard);
+    if (storedBoard != board) {
+        nvs_set_u32(handle, "AUTODETECT", board);
+        nvs_commit(handle);
+    }
+    nvs_close(handle);
 }
 #endif
 
@@ -583,10 +630,13 @@ void setup() {
     Serial.begin(115200);
 
 #if defined(TAG_M5STICKC_PLUS)
+    selectStickCPlusPanel();
     auto config = M5.config();
     config.internal_imu = false;  // Initialize MPU6886 on the explicit I2C bus below.
     M5.begin(config);
-    log_i("M5StickC Plus tag mode: camera endpoint disabled");
+    log_i("M5StickC Plus tag mode: board=%d display=%d",
+          static_cast<int>(M5.getBoard()), static_cast<int>(M5.Display.getBoard()));
+    M5.Display.setBrightness(0);
 #else
     pinMode(POWER_GPIO_NUM, OUTPUT);
     digitalWrite(POWER_GPIO_NUM, LOW);
@@ -613,9 +663,6 @@ void setup() {
         log_e("UWB: mutex allocation failed");
     } else {
         initializeUwb();
-#if defined(TAG_M5STICKC_PLUS)
-        xTaskCreatePinnedToCore(updateStickDisplayTask, "display", 4096, nullptr, 1, nullptr, 0);
-#endif
     }
 
     while (!connectToWifi()) {
@@ -628,6 +675,15 @@ void setup() {
 
 /** Accepts HTTP connections and moves each one to an independent task. */
 void loop() {
+#if defined(TAG_M5STICKC_PLUS)
+    M5.update();
+    if (M5.BtnA.wasPressed() || M5.BtnA.wasClicked()) {
+        log_i("Display: Button A wake request");
+        wakeStickDisplay();
+    }
+    updateStickDisplay();
+#endif
+
     WiFiClient client = server.available();
     if (!client) {
         delay(1);
