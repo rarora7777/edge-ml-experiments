@@ -7,6 +7,9 @@
 
 #include <M5Unified.h>
 #include <WiFi.h>
+#if defined(TAG_M5STICKC_PLUS)
+#include <utility/imu/BMM150_Class.hpp>
+#endif
 #if !defined(TAG_M5STICKC_PLUS)
 #include <esp_camera.h>
 #include <esp_timer.h>
@@ -30,6 +33,7 @@ struct ImuSample {
     float gyro[3] = {};
     float mag[3] = {};
     bool valid = false;
+    bool magAvailable = false;
 };
 
 ImuSample latestImuSample;
@@ -60,6 +64,11 @@ constexpr int kImuSdaPin = 21;
 constexpr int kImuSclPin = 22;
 constexpr i2c_port_t kImuI2cPort = I2C_NUM_1;
 constexpr m5::board_t kImuBoard = m5::board_t::board_M5StickCPlus;
+constexpr int kMagSdaPin = 0;   // ENV-II HAT I2C SDA.
+constexpr int kMagSclPin = 26;  // ENV-II HAT I2C SCL.
+constexpr i2c_port_t kMagI2cPort = I2C_NUM_0;
+constexpr uint8_t kBmm150Address = 0x10;
+constexpr uint32_t kMagI2cFrequency = 400000;
 constexpr int kUwbRxPin = 33;  // Port A G33 receives data from the UWB unit.
 constexpr int kUwbTxPin = 32;  // Port A G32 sends commands to the UWB unit.
 #else
@@ -79,6 +88,11 @@ constexpr char kStreamPart[] =
 #endif
 constexpr uint32_t kWiFiConnectTimeoutMs = 30000;
 constexpr uint32_t kUwbBaudRate = 115200;
+
+#if defined(TAG_M5STICKC_PLUS)
+m5::BMM150_Class stickMagnetometer(kBmm150Address, kMagI2cFrequency, &M5.Ex_I2C);
+bool stickMagnetometerAvailable = false;
+#endif
 
 /** Returns a readable label for an Arduino Wi-Fi connection state. */
 const char* wifiStatusName(wl_status_t status) {
@@ -142,11 +156,31 @@ void updateImuTask(void*) {
                 latestImuSample.mag[0] = sample.mag.x;
                 latestImuSample.mag[1] = sample.mag.y;
                 latestImuSample.mag[2] = sample.mag.z;
+                latestImuSample.magAvailable = true;
+#else
+                latestImuSample.magAvailable = stickMagnetometerAvailable;
 #endif
                 latestImuSample.valid = true;
                 xSemaphoreGive(imuMutex);
             }
         }
+
+#if defined(TAG_M5STICKC_PLUS)
+        if (stickMagnetometerAvailable) {
+            m5::IMU_Base::imu_raw_data_t rawData;
+            if (stickMagnetometer.getImuRawData(&rawData) & m5::IMU_Base::imu_spec_mag) {
+                m5::IMU_Base::imu_convert_param_t conversion;
+                stickMagnetometer.getConvertParam(&conversion);
+                if (xSemaphoreTake(imuMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    latestImuSample.mag[0] = rawData.mag.x * conversion.mag_res;
+                    latestImuSample.mag[1] = rawData.mag.y * conversion.mag_res;
+                    latestImuSample.mag[2] = rawData.mag.z * conversion.mag_res;
+                    latestImuSample.magAvailable = true;
+                    xSemaphoreGive(imuMutex);
+                }
+            }
+        }
+#endif
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -167,6 +201,37 @@ void initializeImuTask(void*) {
 
     M5.Imu.setCalibration(0, 0, 0);
     M5.Imu.clearOffsetData();
+
+#if defined(TAG_M5STICKC_PLUS)
+    log_i("BMM150: configuring ENV-II HAT I2C port %d on SDA=%d SCL=%d",
+          static_cast<int>(kMagI2cPort), kMagSdaPin, kMagSclPin);
+    if (!M5.Ex_I2C.begin(kMagI2cPort, kMagSdaPin, kMagSclPin)) {
+        log_e("BMM150: I2C initialization failed");
+    } else {
+        // BMM150 starts in suspend mode. Power it on before reading its chip
+        // ID, then allow its startup time to elapse.
+        if (!M5.Ex_I2C.writeRegister8(kBmm150Address, 0x4B, 0x01,
+                                       kMagI2cFrequency)) {
+            log_e("BMM150: failed to power on ENV-II HAT");
+        } else {
+            delay(3);
+            const uint8_t chipId =
+                M5.Ex_I2C.readRegister8(kBmm150Address, 0x40, kMagI2cFrequency);
+            if (chipId != 0x32) {
+            log_w("BMM150: expected chip ID 0x32, got 0x%02X (SHT30=%d BMP280=%d)",
+                  chipId, M5.Ex_I2C.scanID(0x44), M5.Ex_I2C.scanID(0x76));
+            } else {
+                if (!M5.Ex_I2C.writeRegister8(kBmm150Address, 0x4C, 0x38,
+                                                kMagI2cFrequency)) {
+                    log_e("BMM150: failed to enable normal measurement mode");
+                } else {
+                    stickMagnetometerAvailable = true;
+                    log_i("BMM150: ENV-II HAT initialization succeeded");
+                }
+            }
+        }
+    }
+#endif
 
     log_i("IMU: initialization succeeded (type=%d)",
           static_cast<int>(M5.Imu.getType()));
@@ -459,14 +524,26 @@ void streamImu(WiFiClient& client) {
     while (client.connected()) {
         const ImuSample sample = getImuSample();
 #if defined(TAG_M5STICKC_PLUS)
-        if (client.printf(
-                "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":false,"
-                "\"accel\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
-                "\"gyro\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f}}\n\n",
-                static_cast<unsigned long>(sample.timestampMs),
-                sample.valid ? "true" : "false",
-                sample.accel[0], sample.accel[1], sample.accel[2],
-                sample.gyro[0], sample.gyro[1], sample.gyro[2]) <= 0) {
+        const int written = sample.magAvailable
+            ? client.printf(
+                  "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":true,"
+                  "\"accel\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
+                  "\"gyro\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
+                  "\"mag\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f}}\n\n",
+                  static_cast<unsigned long>(sample.timestampMs),
+                  sample.valid ? "true" : "false",
+                  sample.accel[0], sample.accel[1], sample.accel[2],
+                  sample.gyro[0], sample.gyro[1], sample.gyro[2],
+                  sample.mag[0], sample.mag[1], sample.mag[2])
+            : client.printf(
+                  "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":false,"
+                  "\"accel\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
+                  "\"gyro\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f}}\n\n",
+                  static_cast<unsigned long>(sample.timestampMs),
+                  sample.valid ? "true" : "false",
+                  sample.accel[0], sample.accel[1], sample.accel[2],
+                  sample.gyro[0], sample.gyro[1], sample.gyro[2]);
+        if (written <= 0) {
             break;
         }
 #else
