@@ -165,6 +165,9 @@ void initializeImuTask(void*) {
         return;
     }
 
+    M5.Imu.setCalibration(0, 0, 0);
+    M5.Imu.clearOffsetData();
+
     log_i("IMU: initialization succeeded (type=%d)",
           static_cast<int>(M5.Imu.getType()));
     xTaskCreatePinnedToCore(updateImuTask, "imu-read", 8192, nullptr, 1, nullptr, 0);
@@ -334,7 +337,7 @@ void initializeUwb() {
     // Reset first: role changes are applied after the module has restarted.
     uwbSerial.print("AT+RST\r\n");
     delay(1000);
-    uwbSerial.print("AT+anchor_tag=0\r\n");
+    uwbSerial.print("AT+anchor_tag=0,0\r\n");
     delay(100);
     uwbSerial.print("AT+interval=5\r\n");
     delay(100);

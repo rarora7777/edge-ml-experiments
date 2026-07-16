@@ -13,8 +13,8 @@ reflashed.
 
 | Physical anchor | PlatformIO environment | UWB ID |
 | --- | --- | --- |
-| Anchor 66 | `anchor-66` | `66` |
-| Anchor 77 | `anchor-77` | `77` |
+| Anchor 66 | `anchor-66` | `0` |
+| Anchor 77 | `anchor-77` | `1` |
 
 Add another environment with a distinct `-DUWB_ANCHOR_ID=<n>` for each added
 anchor. Use three anchors for unambiguous 2D position fixes.

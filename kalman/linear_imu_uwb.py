@@ -1,5 +1,8 @@
 import argparse
+from collections import deque
 import json
+from pathlib import Path
+import queue
 import re
 import threading
 import time
@@ -15,10 +18,166 @@ DEFAULT_Q_POS = 1e-6
 DEFAULT_Q_VEL = 1e-3
 DEFAULT_Q_BIAS = 1e-4
 DEFAULT_R_UWB = 0.05**2
+ACCEL_HISTORY_MS = 10_000
+GRAVITY_G = 1.0
+STILLNESS_WINDOW_MS = 2_000
+GYRO_STILL_EPSILON_DPS = 4.0
+GYRO_STABILITY_EPSILON_DPS = 5.0
+ACCEL_STABILITY_EPSILON_G = 0.03
+ACCEL_GRAVITY_EPSILON_G = 0.20
+MIN_ACCEL_CALIBRATION_ORIENTATIONS = 6
+DEFAULT_IMU_CALIBRATION_FILE = "imu_calibration.json"
+DEFAULT_UWB_CALIBRATION_FILE = "uwb_calibration.json"
+UWB_CALIBRATION_ANCHOR_IDS = (0, 1)
 
 # ==============================================================================
 # 1. STREAMING KALMAN FILTER IMPLEMENTATION
 # ==============================================================================
+
+
+class ImplicitImuCalibrator:
+    """Learns IMU offsets from stationary intervals without a calibration UI.
+
+    Gyro bias is the least-squares mean of gyro samples observed while still.
+    Accelerometer bias is fitted from the constraint that static corrected
+    acceleration vectors lie on a 1 g sphere. It needs several still device
+    orientations before an accelerometer correction is valid.
+    """
+
+    def __init__(self, calibration_path):
+        self.calibration_path = Path(calibration_path)
+        self.window = deque()
+        self.gyro_sum = np.zeros(3)
+        self.gyro_sample_count = 0
+        self.accel_orientation_samples = []
+        self.gyro_bias = np.zeros(3)
+        self.gyro_bias_valid = False
+        self.accel_bias = np.zeros(3)
+        self.accel_bias_valid = False
+        self.was_still = False
+        self._load_calibration()
+
+    def update(self, timestamp_ms, accel_g, gyro_dps):
+        """Returns bias-corrected acceleration, gyro, and current stillness."""
+        accel_g = np.asarray(accel_g, dtype=float)
+        gyro_dps = np.asarray(gyro_dps, dtype=float)
+        self.window.append((timestamp_ms, accel_g, gyro_dps))
+        cutoff_ms = timestamp_ms - STILLNESS_WINDOW_MS
+        while self.window and self.window[0][0] < cutoff_ms:
+            self.window.popleft()
+
+        is_still = self._is_still(timestamp_ms)
+        if is_still:
+            window_accel = np.array([sample[1] for sample in self.window])
+            window_gyro = np.array([sample[2] for sample in self.window])
+            if not self.gyro_bias_valid:
+                # Before an offset is known, quiet gyro variation—not its raw
+                # magnitude—identifies a likely stationary human-held device.
+                self.gyro_bias = window_gyro.mean(axis=0)
+                self.gyro_sum = self.gyro_bias * len(window_gyro)
+                self.gyro_sample_count = len(window_gyro)
+                self.gyro_bias_valid = True
+                print(f"IMU calibration: gyro bias = {self.gyro_bias} dps")
+                self._save_calibration()
+            else:
+                # The mean is the least-squares solution for a constant gyro bias.
+                self.gyro_sum += gyro_dps
+                self.gyro_sample_count += 1
+                self.gyro_bias = self.gyro_sum / self.gyro_sample_count
+
+            if not self.was_still:
+                self._add_accel_orientation(window_accel.mean(axis=0))
+                self._fit_accel_bias()
+        self.was_still = is_still
+
+        return accel_g - self.accel_bias, gyro_dps - self.gyro_bias, is_still
+
+    def _is_still(self, timestamp_ms):
+        if not self.window or timestamp_ms - self.window[0][0] < STILLNESS_WINDOW_MS:
+            return False
+
+        accel = np.array([sample[1] for sample in self.window])
+        raw_gyro = np.array([sample[2] for sample in self.window])
+        gyro_deviation = np.linalg.norm(raw_gyro - raw_gyro.mean(axis=0), axis=1)
+        accel_deviation = np.linalg.norm(accel - accel.mean(axis=0), axis=1)
+        is_quiet_and_gravity_consistent = (
+            np.max(gyro_deviation) < GYRO_STABILITY_EPSILON_DPS
+            and np.max(accel_deviation) < ACCEL_STABILITY_EPSILON_G
+            and abs(np.linalg.norm(accel.mean(axis=0)) - GRAVITY_G) < ACCEL_GRAVITY_EPSILON_G
+        )
+        if not self.gyro_bias_valid:
+            return is_quiet_and_gravity_consistent
+
+        corrected_gyro_norm = np.linalg.norm(raw_gyro - self.gyro_bias, axis=1)
+        return (
+            is_quiet_and_gravity_consistent
+            and np.max(corrected_gyro_norm) < GYRO_STILL_EPSILON_DPS
+        )
+
+    def _add_accel_orientation(self, mean_accel_g):
+        """Keeps only stationary poses that add a meaningfully new direction."""
+        if any(np.linalg.norm(mean_accel_g - sample) < 0.15 for sample in self.accel_orientation_samples):
+            return
+        self.accel_orientation_samples.append(mean_accel_g)
+        print(
+            "IMU calibration: collected "
+            f"{len(self.accel_orientation_samples)}/{MIN_ACCEL_CALIBRATION_ORIENTATIONS} still orientations"
+        )
+
+    def _fit_accel_bias(self):
+        if len(self.accel_orientation_samples) < MIN_ACCEL_CALIBRATION_ORIENTATIONS:
+            return
+
+        samples = np.array(self.accel_orientation_samples)
+        # ||a - b||^2 = g^2 becomes 2 a.b + d = ||a||^2,
+        # where b is the accelerometer bias and d = g^2 - ||b||^2.
+        design = np.column_stack((2.0 * samples, np.ones(len(samples))))
+        solution, _, rank, _ = np.linalg.lstsq(design, np.sum(samples**2, axis=1), rcond=None)
+        if rank == 4:
+            self.accel_bias = solution[:3]
+            self.accel_bias_valid = True
+            print(f"IMU calibration: accelerometer bias = {self.accel_bias} g")
+            self._save_calibration()
+
+    def _load_calibration(self):
+        """Loads a previously validated calibration, if present and well formed."""
+        try:
+            data = json.loads(self.calibration_path.read_text(encoding="utf-8"))
+            accel_bias = np.asarray(data["accel_bias_g"], dtype=float)
+            gyro_bias = np.asarray(data["gyro_bias_dps"], dtype=float)
+            accel_bias_valid = bool(data.get("accel_bias_valid", True))
+            if accel_bias.shape != (3,) or gyro_bias.shape != (3,) or not (
+                np.all(np.isfinite(accel_bias)) and np.all(np.isfinite(gyro_bias))
+            ):
+                raise ValueError("bias vectors must contain three finite values")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as error:
+            print(f"Ignoring invalid IMU calibration file {self.calibration_path}: {error}")
+            return
+
+        self.accel_bias = accel_bias
+        self.gyro_bias = gyro_bias
+        self.gyro_bias_valid = True
+        self.accel_bias_valid = accel_bias_valid
+        print(f"Loaded IMU calibration from {self.calibration_path}")
+
+    def _save_calibration(self):
+        """Atomically persists the currently valid IMU bias estimates."""
+        data = {
+            "version": 1,
+            "accel_bias_g": self.accel_bias.tolist(),
+            "accel_bias_valid": self.accel_bias_valid,
+            "gyro_bias_dps": self.gyro_bias.tolist(),
+        }
+        temporary_path = self.calibration_path.with_suffix(self.calibration_path.suffix + ".tmp")
+        try:
+            self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            temporary_path.replace(self.calibration_path)
+            print(f"Saved IMU calibration to {self.calibration_path}")
+        except OSError as error:
+            print(f"Unable to save IMU calibration to {self.calibration_path}: {error}")
 
 
 class KalmanFilter2DStreaming:
@@ -160,6 +319,40 @@ class UWBBufferPipeline:
         return None, None
 
 
+def parse_uwb_measurement(sample):
+    """Returns an anchor ID and range from either structured or legacy UWB SSE data."""
+    anchor_id = sample.get("anchor_id")
+    distance_m = sample.get("distance_m")
+    if anchor_id is None or distance_m is None:
+        match = re.fullmatch(
+            r"an(\d+):([0-9]+(?:\.[0-9]+)?)m", sample.get("report", "").strip()
+        )
+        if match is None:
+            return None
+        anchor_id, distance_m = match.groups()
+    return int(anchor_id), float(distance_m)
+
+
+def load_uwb_offsets(calibration_path):
+    """Loads per-anchor additive range offsets, returning an empty map if unavailable."""
+    path = Path(calibration_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        offsets = {
+            int(anchor_id): float(values["offset_m"])
+            for anchor_id, values in data["anchors"].items()
+        }
+        if not all(np.isfinite(offset) for offset in offsets.values()):
+            raise ValueError("offsets must be finite")
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as error:
+        print(f"Ignoring invalid UWB calibration file {path}: {error}")
+        return {}
+    print(f"Loaded UWB range offsets from {path}")
+    return offsets
+
+
 # ==============================================================================
 # 3. STREAM SIMULATOR HARNESS
 # ==============================================================================
@@ -294,16 +487,21 @@ def run_simulation(d_anchors, q_pos, q_vel, q_bias, r_uwb):
 class LiveTracker:
     """Consumes AtomS3R IMU and UWB SSE streams and displays live estimates."""
 
-    def __init__(self, ip_address, d_anchors, q_pos, q_vel, q_bias, r_uwb):
+    def __init__(self, ip_address, d_anchors, q_pos, q_vel, q_bias, r_uwb, calibration_path,
+                 uwb_calibration_path):
         self.base_url = f"http://{ip_address}"
         self.kf = KalmanFilter2DStreaming(q_pos, q_vel, q_bias, r_uwb)
+        self.imu_calibrator = ImplicitImuCalibrator(calibration_path)
+        self.uwb_offsets = load_uwb_offsets(uwb_calibration_path)
         self.uwb_pipe = UWBBufferPipeline(d_anchors, self.kf)
         self.d_anchors = d_anchors
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.est_positions = []
-        self.uwb_positions = []
+        self.est_positions = deque()
+        self.uwb_positions = deque()
         self.latest_ranges = {}
+        self.accel_samples = deque()
+        self.gyro_samples = deque()
 
     def run(self):
         """Starts both SSE readers and maintains an interactive position plot."""
@@ -315,11 +513,11 @@ class LiveTracker:
             thread.start()
 
         plt.ion()
-        figure, axis = plt.subplots(figsize=(7, 6))
-        figure.subplots_adjust(right=0.72)
+        figure, (position_axis, accel_axis, gyro_axis) = plt.subplots(3, 1, figsize=(8, 12))
+        figure.subplots_adjust(right=0.78)
         try:
             while plt.fignum_exists(figure.number):
-                self._draw(axis)
+                self._draw(position_axis, accel_axis, gyro_axis)
                 plt.pause(0.1)
         except KeyboardInterrupt:
             pass
@@ -355,34 +553,38 @@ class LiveTracker:
         if not sample.get("valid", False):
             return
         accel = sample["accel"]
+        gyro = sample["gyro"]
         with self.lock:
-            self.kf.predict_stream(sample["timestamp_ms"], accel["x"], accel["y"])
-            self.est_positions.append(tuple(self.kf.x[:2, 0]))
+            timestamp_ms = sample["timestamp_ms"]
+            corrected_accel, corrected_gyro, _ = self.imu_calibrator.update(
+                timestamp_ms,
+                (accel["x"], accel["y"], accel["z"]),
+                (gyro["x"], gyro["y"], gyro["z"]),
+            )
+            self.kf.predict_stream(timestamp_ms, corrected_accel[0], corrected_accel[1])
+            self.est_positions.append((timestamp_ms, *self.kf.x[:2, 0]))
+            self.accel_samples.append((timestamp_ms, *corrected_accel))
+            self.gyro_samples.append((timestamp_ms, *corrected_gyro))
+            self._trim_history(timestamp_ms)
 
     def _handle_uwb(self, sample):
         """Displays raw ranges, then pairs them for UWB-only and fused estimates."""
-        anchor_id = sample.get("anchor_id")
-        distance_m = sample.get("distance_m")
-        sequence = sample.get("sequence")
-        if anchor_id is None or distance_m is None:
-            # Compatibility with firmware that sends only the raw Unit UWB report.
-            match = re.fullmatch(
-                r"an(\d+):([0-9]+(?:\.[0-9]+)?)m", sample.get("report", "").strip()
-            )
-            if match is None:
-                return
-            anchor_id, distance_m = match.groups()
+        measurement = parse_uwb_measurement(sample)
+        if measurement is None:
+            return
+        anchor_id, raw_distance_m = measurement
 
         with self.lock:
-            anchor_id = int(anchor_id)
-            distance_m = float(distance_m)
+            distance_m = raw_distance_m - self.uwb_offsets.get(anchor_id, 0.0)
             self.latest_ranges[anchor_id] = distance_m
             x_uwb, y_uwb = self.uwb_pipe.handle_uwb_stream(
                 anchor_id, distance_m
             )
             if x_uwb is None:
                 return
-            self.uwb_positions.append((x_uwb, y_uwb))
+            timestamp_ms = sample.get("timestamp_ms", self.kf.last_timestamp_ms or 0)
+            self.uwb_positions.append((timestamp_ms, x_uwb, y_uwb))
+            self._trim_history(timestamp_ms)
             fused_x, fused_y = self.kf.x[:2, 0]
             print(
                 f"ranges: r0={self.latest_ranges.get(0, float('nan')):.2f} m, "
@@ -391,24 +593,156 @@ class LiveTracker:
                 f"fused ({fused_x:.2f}, {fused_y:.2f}) m"
             )
 
-    def _draw(self, axis):
-        """Renders the latest UWB fixes and Kalman estimates without retaining artists."""
+    def _trim_history(self, latest_timestamp_ms):
+        """Discards trajectory and acceleration samples older than the display window."""
+        cutoff_ms = latest_timestamp_ms - ACCEL_HISTORY_MS
+        for history in (self.est_positions, self.uwb_positions, self.accel_samples, self.gyro_samples):
+            while history and history[0][0] < cutoff_ms:
+                history.popleft()
+
+    def _draw(self, position_axis, accel_axis, gyro_axis):
+        """Renders the latest position estimates plus ten seconds of IMU data."""
         with self.lock:
             uwb_positions = np.array(self.uwb_positions)
             est_positions = np.array(self.est_positions)
+            accel_samples = np.array(self.accel_samples)
+            gyro_samples = np.array(self.gyro_samples)
 
-        axis.clear()
-        axis.scatter([0, self.d_anchors], [0, 0], color="black", marker="^", s=100, label="Anchors")
-        if len(uwb_positions):
-            axis.plot(uwb_positions[:, 0], uwb_positions[:, 1], "r.", label="UWB fixes")
+        position_axis.clear()
+        position_axis.scatter([0, self.d_anchors], [0, 0], color="black", marker="^", s=100, label="Anchors")
         if len(est_positions):
-            axis.plot(est_positions[:, 0], est_positions[:, 1], "b-", label="Kalman estimate")
-        axis.set_title("Live UWB/IMU Tracker")
-        axis.set_xlabel("X (metres)")
-        axis.set_ylabel("Y (metres)")
-        axis.set_aspect("equal")
-        axis.grid(True)
-        axis.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+            position_axis.plot(est_positions[:, 1], est_positions[:, 2], "b-", label="Kalman estimate")
+        if len(uwb_positions):
+            position_axis.scatter(
+                uwb_positions[:, 1], uwb_positions[:, 2], color="red", s=36,
+                label="UWB fixes", zorder=3,
+            )
+        position_axis.set_title("Live UWB/IMU Tracker (last 10 seconds)")
+        position_axis.set_xlabel("X (metres)")
+        position_axis.set_ylabel("Y (metres)")
+        position_axis.set_aspect("equal")
+        position_axis.grid(True)
+        position_axis.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+
+        accel_axis.clear()
+        if len(accel_samples):
+            latest_time_ms = accel_samples[-1, 0]
+            time_s = (accel_samples[:, 0] - latest_time_ms) / 1000.0
+            accel_axis.plot(time_s, accel_samples[:, 1], label="X")
+            accel_axis.plot(time_s, accel_samples[:, 2], label="Y")
+            accel_axis.plot(time_s, accel_samples[:, 3], label="Z")
+        accel_axis.set_title("Bias-corrected accelerometer (last 10 seconds)")
+        accel_axis.set_xlabel("Time relative to latest sample (s)")
+        accel_axis.set_ylabel("Acceleration (g)")
+        accel_axis.set_xlim(-ACCEL_HISTORY_MS / 1000.0, 0)
+        accel_axis.grid(True)
+        accel_axis.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+
+        gyro_axis.clear()
+        if len(gyro_samples):
+            latest_time_ms = gyro_samples[-1, 0]
+            time_s = (gyro_samples[:, 0] - latest_time_ms) / 1000.0
+            gyro_axis.plot(time_s, gyro_samples[:, 1], label="X")
+            gyro_axis.plot(time_s, gyro_samples[:, 2], label="Y")
+            gyro_axis.plot(time_s, gyro_samples[:, 3], label="Z")
+        gyro_axis.set_title("Bias-corrected gyroscope (last 10 seconds)")
+        gyro_axis.set_xlabel("Time relative to latest sample (s)")
+        gyro_axis.set_ylabel("Angular velocity (°/s)")
+        gyro_axis.set_xlim(-ACCEL_HISTORY_MS / 1000.0, 0)
+        gyro_axis.grid(True)
+        gyro_axis.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+
+
+def run_uwb_calibration(ip_address, distances_m, samples_per_anchor, calibration_path):
+    """Guides surveyed-distance UWB range calibration and saves per-anchor offsets."""
+    events = queue.Queue()
+    stop_event = threading.Event()
+    url = f"http://{ip_address}/uwb/stream"
+
+    def read_uwb_events():
+        while not stop_event.is_set():
+            try:
+                request = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    for raw_line in response:
+                        if stop_event.is_set():
+                            return
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            events.put(json.loads(line[5:].strip()))
+                        except json.JSONDecodeError:
+                            continue
+            except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
+                if not stop_event.is_set():
+                    print(f"UWB stream disconnected: {error}; retrying in 2 seconds")
+                    stop_event.wait(2)
+
+    reader = threading.Thread(target=read_uwb_events, daemon=True)
+    reader.start()
+    print("Connecting to the UWB stream and discarding any retained reports...")
+    time.sleep(1)
+    while not events.empty():
+        events.get_nowait()
+
+    residuals = {anchor_id: [] for anchor_id in UWB_CALIBRATION_ANCHOR_IDS}
+    try:
+        for anchor_id in UWB_CALIBRATION_ANCHOR_IDS:
+            for distance_m in distances_m:
+                input(
+                    f"Place the tag {distance_m:g} m from anchor {anchor_id} with clear line of sight, "
+                    "then press Enter to collect samples: "
+                )
+                while not events.empty():
+                    events.get_nowait()
+                samples = []
+                while len(samples) < samples_per_anchor:
+                    try:
+                        sample = events.get(timeout=10)
+                    except queue.Empty:
+                        print("Waiting for UWB reports...")
+                        continue
+                    measurement = parse_uwb_measurement(sample)
+                    if measurement is None or measurement[0] != anchor_id:
+                        continue
+                    measured_distance_m = measurement[1]
+                    samples.append(measured_distance_m)
+                    print(
+                        f"anchor {anchor_id}, {distance_m:g} m: "
+                        f"{len(samples)}/{samples_per_anchor} = {measured_distance_m:.3f} m"
+                    )
+                residuals[anchor_id].extend(value - distance_m for value in samples)
+    except KeyboardInterrupt:
+        print("UWB calibration cancelled; no file written")
+        return
+    finally:
+        stop_event.set()
+
+    offsets = {anchor_id: float(np.median(values)) for anchor_id, values in residuals.items()}
+    data = {
+        "version": 1,
+        "distances_m": list(distances_m),
+        "samples_per_anchor": samples_per_anchor,
+        "anchors": {
+            str(anchor_id): {
+                "offset_m": offsets[anchor_id],
+                "residual_std_m": float(np.std(values)),
+            }
+            for anchor_id, values in residuals.items()
+        },
+    }
+    path = Path(calibration_path)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(path)
+    for anchor_id, values in residuals.items():
+        print(
+            f"Anchor {anchor_id}: offset={offsets[anchor_id]:+.3f} m, "
+            f"residual std={np.std(values):.3f} m"
+        )
+    print(f"Saved UWB range calibration to {path}")
 
 
 def parse_args():
@@ -425,15 +759,31 @@ def parse_args():
                         help=f"accelerometer-bias process noise (default: {DEFAULT_Q_BIAS:g})")
     parser.add_argument("--r-uwb", type=float, default=DEFAULT_R_UWB,
                         help=f"UWB measurement variance in m^2 (default: {DEFAULT_R_UWB:g})")
+    parser.add_argument("--imu-calibration", default=DEFAULT_IMU_CALIBRATION_FILE,
+                        help="path for persistent IMU biases (default: imu_calibration.json)")
+    parser.add_argument("--uwb-calibration", default=DEFAULT_UWB_CALIBRATION_FILE,
+                        help="path for persistent UWB range offsets (default: uwb_calibration.json)")
+    parser.add_argument("--uwb-calibrate", type=float, nargs="+", metavar="METRES",
+                        help="run guided UWB calibration at these surveyed distances")
+    parser.add_argument("--uwb-calibration-samples", type=int, default=10,
+                        help="reports per anchor at each UWB calibration distance (default: 10)")
     args = parser.parse_args()
     if args.distance <= 0 or min(args.q_pos, args.q_vel, args.q_bias, args.r_uwb) < 0:
         parser.error("distance must be positive and noise values must be non-negative")
+    if args.uwb_calibrate is not None and (not args.ip or min(args.uwb_calibrate) <= 0):
+        parser.error("--uwb-calibrate requires --ip and positive surveyed distances")
+    if args.uwb_calibration_samples <= 0:
+        parser.error("--uwb-calibration-samples must be positive")
     return args
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.ip:
-        LiveTracker(args.ip, args.distance, args.q_pos, args.q_vel, args.q_bias, args.r_uwb).run()
+    if args.uwb_calibrate is not None:
+        run_uwb_calibration(args.ip, args.uwb_calibrate, args.uwb_calibration_samples,
+                            args.uwb_calibration)
+    elif args.ip:
+        LiveTracker(args.ip, args.distance, args.q_pos, args.q_vel, args.q_bias, args.r_uwb,
+                    args.imu_calibration, args.uwb_calibration).run()
     else:
         run_simulation(args.distance, args.q_pos, args.q_vel, args.q_bias, args.r_uwb)
