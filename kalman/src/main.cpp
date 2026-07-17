@@ -8,7 +8,7 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #if defined(TAG_M5STICKC_PLUS)
-#include <utility/imu/BMM150_Class.hpp>
+#include <M5_BMM150.h>
 #endif
 #if !defined(TAG_M5STICKC_PLUS)
 #include <esp_camera.h>
@@ -90,8 +90,28 @@ constexpr uint32_t kWiFiConnectTimeoutMs = 30000;
 constexpr uint32_t kUwbBaudRate = 115200;
 
 #if defined(TAG_M5STICKC_PLUS)
-m5::BMM150_Class stickMagnetometer(kBmm150Address, kMagI2cFrequency, &M5.Ex_I2C);
+bmm150_dev stickMagnetometer = {};
 bool stickMagnetometerAvailable = false;
+
+/** BMM150 compensated-driver I2C read callback for the ENV-II HAT. */
+int8_t readStickMagnetometer(uint8_t deviceAddress, uint8_t registerAddress,
+                             uint8_t* data, uint16_t length) {
+    return M5.Ex_I2C.readRegister(deviceAddress, registerAddress, data, length,
+                                   kMagI2cFrequency)
+        ? BMM150_OK : BMM150_E_DEV_NOT_FOUND;
+}
+
+/** BMM150 compensated-driver I2C write callback for the ENV-II HAT. */
+int8_t writeStickMagnetometer(uint8_t deviceAddress, uint8_t registerAddress,
+                              uint8_t* data, uint16_t length) {
+    return M5.Ex_I2C.writeRegister(deviceAddress, registerAddress, data, length,
+                                    kMagI2cFrequency)
+        ? BMM150_OK : BMM150_E_DEV_NOT_FOUND;
+}
+
+void delayStickMagnetometer(uint32_t milliseconds) {
+    delay(milliseconds);
+}
 #endif
 
 /** Returns a readable label for an Arduino Wi-Fi connection state. */
@@ -167,14 +187,16 @@ void updateImuTask(void*) {
 
 #if defined(TAG_M5STICKC_PLUS)
         if (stickMagnetometerAvailable) {
-            m5::IMU_Base::imu_raw_data_t rawData;
-            if (stickMagnetometer.getImuRawData(&rawData) & m5::IMU_Base::imu_spec_mag) {
-                m5::IMU_Base::imu_convert_param_t conversion;
-                stickMagnetometer.getConvertParam(&conversion);
+            if (bmm150_read_mag_data(&stickMagnetometer) == BMM150_OK) {
                 if (xSemaphoreTake(imuMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    latestImuSample.mag[0] = rawData.mag.x * conversion.mag_res;
-                    latestImuSample.mag[1] = rawData.mag.y * conversion.mag_res;
-                    latestImuSample.mag[2] = rawData.mag.z * conversion.mag_res;
+                    // M5_BMM150 applies the BMM150's factory trim compensation
+                    // and reports microtesla. Do not apply or persist hard/soft-
+                    // iron offsets here; the raw compensated field is streamed.
+                    // ENV-II BMM150 axes differ from the onboard IMU: flip X/Z
+                    // once here so every stream consumer receives IMU-frame data.
+                    latestImuSample.mag[0] = -stickMagnetometer.data.x;
+                    latestImuSample.mag[1] = stickMagnetometer.data.y;
+                    latestImuSample.mag[2] = -stickMagnetometer.data.z;
                     latestImuSample.magAvailable = true;
                     xSemaphoreGive(imuMutex);
                 }
@@ -208,25 +230,27 @@ void initializeImuTask(void*) {
     if (!M5.Ex_I2C.begin(kMagI2cPort, kMagSdaPin, kMagSclPin)) {
         log_e("BMM150: I2C initialization failed");
     } else {
-        // BMM150 starts in suspend mode. Power it on before reading its chip
-        // ID, then allow its startup time to elapse.
-        if (!M5.Ex_I2C.writeRegister8(kBmm150Address, 0x4B, 0x01,
-                                       kMagI2cFrequency)) {
-            log_e("BMM150: failed to power on ENV-II HAT");
+        // Use only the BMM150's factory trim compensation. This driver has no
+        // persisted hard/soft-iron calibration state to load or apply.
+        stickMagnetometer = {};
+        stickMagnetometer.dev_id = kBmm150Address;
+        stickMagnetometer.intf = BMM150_I2C_INTF;
+        stickMagnetometer.read = readStickMagnetometer;
+        stickMagnetometer.write = writeStickMagnetometer;
+        stickMagnetometer.delay_ms = delayStickMagnetometer;
+        if (bmm150_init(&stickMagnetometer) != BMM150_OK) {
+            log_e("BMM150: initialization or factory-trim read failed");
         } else {
-            delay(3);
-            const uint8_t chipId =
-                M5.Ex_I2C.readRegister8(kBmm150Address, 0x40, kMagI2cFrequency);
-            if (chipId != 0x32) {
-            log_w("BMM150: expected chip ID 0x32, got 0x%02X (SHT30=%d BMP280=%d)",
-                  chipId, M5.Ex_I2C.scanID(0x44), M5.Ex_I2C.scanID(0x76));
+            stickMagnetometer.settings.pwr_mode = BMM150_NORMAL_MODE;
+            if (bmm150_set_op_mode(&stickMagnetometer) != BMM150_OK) {
+                log_e("BMM150: failed to enable normal measurement mode");
             } else {
-                if (!M5.Ex_I2C.writeRegister8(kBmm150Address, 0x4C, 0x38,
-                                                kMagI2cFrequency)) {
-                    log_e("BMM150: failed to enable normal measurement mode");
+                stickMagnetometer.settings.preset_mode = BMM150_PRESETMODE_ENHANCED;
+                if (bmm150_set_presetmode(&stickMagnetometer) != BMM150_OK) {
+                    log_e("BMM150: failed to configure enhanced measurement mode");
                 } else {
                     stickMagnetometerAvailable = true;
-                    log_i("BMM150: ENV-II HAT initialization succeeded");
+                    log_i("BMM150: ENV-II HAT initialized with factory compensation");
                 }
             }
         }
