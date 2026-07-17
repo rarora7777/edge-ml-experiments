@@ -32,6 +32,7 @@ struct ImuSample {
     float accel[3] = {};
     float gyro[3] = {};
     float mag[3] = {};
+    uint32_t magSequence = 0;
     bool valid = false;
     bool magAvailable = false;
 };
@@ -162,7 +163,8 @@ camera_config_t cameraConfig = {
 /** Continuously reads the onboard IMU and publishes the most recent sample. */
 void updateImuTask(void*) {
     for (;;) {
-        if (M5.Imu.update()) {
+        const auto updatedSensors = M5.Imu.update();
+        if (updatedSensors) {
             const auto sample = M5.Imu.getImuData();
             if (xSemaphoreTake(imuMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 latestImuSample.timestampMs = sample.usec / 1000;
@@ -177,6 +179,9 @@ void updateImuTask(void*) {
                 latestImuSample.mag[1] = sample.mag.y;
                 latestImuSample.mag[2] = sample.mag.z;
                 latestImuSample.magAvailable = true;
+                if (updatedSensors & m5::IMU_Class::sensor_mask_mag) {
+                    ++latestImuSample.magSequence;
+                }
 #else
                 latestImuSample.magAvailable = stickMagnetometerAvailable;
 #endif
@@ -187,7 +192,9 @@ void updateImuTask(void*) {
 
 #if defined(TAG_M5STICKC_PLUS)
         if (stickMagnetometerAvailable) {
-            if (bmm150_read_mag_data(&stickMagnetometer) == BMM150_OK) {
+            if (bmm150_get_interrupt_status(&stickMagnetometer) == BMM150_OK
+                && (stickMagnetometer.int_status & BMM150_DATA_READY_INT)
+                && bmm150_read_mag_data(&stickMagnetometer) == BMM150_OK) {
                 if (xSemaphoreTake(imuMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     // M5_BMM150 applies the BMM150's factory trim compensation
                     // and reports microtesla. Do not apply or persist hard/soft-
@@ -198,12 +205,13 @@ void updateImuTask(void*) {
                     latestImuSample.mag[1] = stickMagnetometer.data.y;
                     latestImuSample.mag[2] = -stickMagnetometer.data.z;
                     latestImuSample.magAvailable = true;
+                    ++latestImuSample.magSequence;
                     xSemaphoreGive(imuMutex);
                 }
             }
         }
 #endif
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -536,7 +544,7 @@ bool writeJsonString(WiFiClient& client, const char* value) {
     return client.write('"') == 1;
 }
 
-/** Serves the IMU snapshot as a 50 Hz server-sent event stream. */
+/** Serves the IMU snapshot as a 100 Hz server-sent event stream. */
 void streamImu(WiFiClient& client) {
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/event-stream");
@@ -545,22 +553,31 @@ void streamImu(WiFiClient& client) {
     client.println("Access-Control-Allow-Origin: *");
     client.println();
 
+    uint32_t lastMagSequence = 0;
+    bool sentMagSample = false;
     while (client.connected()) {
         const ImuSample sample = getImuSample();
+        const bool magFresh = sample.magAvailable
+            && (!sentMagSample || sample.magSequence != lastMagSequence);
+        if (sample.magAvailable) {
+            lastMagSequence = sample.magSequence;
+            sentMagSample = true;
+        }
 #if defined(TAG_M5STICKC_PLUS)
         const int written = sample.magAvailable
             ? client.printf(
-                  "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":true,"
+                  "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":true,\"mag_fresh\":%s,"
                   "\"accel\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
                   "\"gyro\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
                   "\"mag\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f}}\n\n",
                   static_cast<unsigned long>(sample.timestampMs),
                   sample.valid ? "true" : "false",
+                  magFresh ? "true" : "false",
                   sample.accel[0], sample.accel[1], sample.accel[2],
                   sample.gyro[0], sample.gyro[1], sample.gyro[2],
                   sample.mag[0], sample.mag[1], sample.mag[2])
             : client.printf(
-                  "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":false,"
+                  "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":false,\"mag_fresh\":false,"
                   "\"accel\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
                   "\"gyro\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f}}\n\n",
                   static_cast<unsigned long>(sample.timestampMs),
@@ -572,19 +589,20 @@ void streamImu(WiFiClient& client) {
         }
 #else
         if (client.printf(
-                "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":true,"
+                "event: imu\ndata: {\"timestamp_ms\":%lu,\"valid\":%s,\"mag_available\":true,\"mag_fresh\":%s,"
                 "\"accel\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
                 "\"gyro\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f},"
                 "\"mag\":{\"x\":%.6f,\"y\":%.6f,\"z\":%.6f}}\n\n",
                 static_cast<unsigned long>(sample.timestampMs),
                 sample.valid ? "true" : "false",
+                magFresh ? "true" : "false",
                 sample.accel[0], sample.accel[1], sample.accel[2],
                 sample.gyro[0], sample.gyro[1], sample.gyro[2],
                 sample.mag[0], sample.mag[1], sample.mag[2]) <= 0) {
             break;
         }
 #endif
-        delay(20);
+        delay(10);
     }
 
     client.stop();

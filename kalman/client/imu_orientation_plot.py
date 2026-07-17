@@ -21,8 +21,8 @@ import numpy as np
 from ahrs.filters import EKF, Madgwick
 
 
-SENSOR_COLUMNS = ("accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z",
-                  "mag_x", "mag_y", "mag_z")
+SENSOR_COLUMNS = ("accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z")
+MAG_COLUMNS = ("mag_x", "mag_y", "mag_z")
 
 
 def as_bool(value: str) -> bool:
@@ -30,8 +30,8 @@ def as_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
-def load_recording(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return device timestamps, acceleration (g), gyro (dps), and mag (uT)."""
+def load_recording(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return timestamps, accel, gyro, mag, and the fresh-mag flag from a recording."""
     rows = []
     with path.open(newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
@@ -44,16 +44,27 @@ def load_recording(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
             try:
                 accel = [float(row[column]) for column in SENSOR_COLUMNS[:3]]
                 gyro = [float(row[column]) for column in SENSOR_COLUMNS[3:6]]
-                mag = [float(row[column]) for column in SENSOR_COLUMNS[6:]]
                 timestamp_ms = float(row["timestamp_ms"])
+                mag = [float(row[column]) for column in MAG_COLUMNS]
             except (KeyError, TypeError, ValueError):
-                continue
-            rows.append((timestamp_ms, accel, gyro, mag))
+                # Samples without a magnetometer value are still usable by the
+                # IMU-only AHRS update.
+                try:
+                    timestamp_ms = float(row["timestamp_ms"])
+                    accel = [float(row[column]) for column in SENSOR_COLUMNS[:3]]
+                    gyro = [float(row[column]) for column in SENSOR_COLUMNS[3:]]
+                    mag = [np.nan, np.nan, np.nan]
+                except (KeyError, TypeError, ValueError):
+                    continue
+            mag_fresh = as_bool(row.get("mag_fresh", row.get("mag_available", "true")))
+            mag_fresh = mag_fresh and np.all(np.isfinite(mag))
+            rows.append((timestamp_ms, accel, gyro, mag, mag_fresh))
 
     if len(rows) < 2:
         raise ValueError("recording needs at least two valid IMU samples")
-    timestamps, accel, gyro, mag = zip(*rows)
-    return (np.asarray(timestamps), np.asarray(accel), np.asarray(gyro), np.asarray(mag))
+    timestamps, accel, gyro, mag, mag_fresh = zip(*rows)
+    return (np.asarray(timestamps), np.asarray(accel), np.asarray(gyro), np.asarray(mag),
+            np.asarray(mag_fresh, dtype=bool))
 
 
 def load_calibration(path: Path | None) -> tuple[np.ndarray, np.ndarray]:
@@ -104,7 +115,8 @@ def quaternion_to_world_axes(quaternions: np.ndarray) -> np.ndarray:
 
 
 def estimate_orientation(algorithm: str, accel_g: np.ndarray, gyro_dps: np.ndarray,
-                         mag_ut: np.ndarray, dt: np.ndarray) -> np.ndarray:
+                         mag_ut: np.ndarray, mag_fresh: np.ndarray,
+                         dt: np.ndarray) -> np.ndarray:
     """Run the selected AHRS filter and return scalar-first quaternions."""
     frequency = 1.0 / float(np.median(dt))
     # EKF fixes its measurement dimension at construction. The placeholder
@@ -119,13 +131,21 @@ def estimate_orientation(algorithm: str, accel_g: np.ndarray, gyro_dps: np.ndarr
 
     for index in range(1, len(accel_g)):
         if isinstance(orientation_filter, EKF):
-            quaternions[index] = orientation_filter.update(
-                quaternions[index - 1], gyro_rad_s[index], accel_g[index],
-                mag=mag_ut[index], dt=float(dt[index]))
-        else:
+            orientation_filter.mag = mag_ut[index] if mag_fresh[index] else None
+            if mag_fresh[index]:
+                quaternions[index] = orientation_filter.update(
+                    quaternions[index - 1], gyro_rad_s[index], accel_g[index],
+                    mag=mag_ut[index], dt=float(dt[index]))
+            else:
+                quaternions[index] = orientation_filter.update(
+                    quaternions[index - 1], gyro_rad_s[index], accel_g[index], dt=float(dt[index]))
+        elif mag_fresh[index]:
             quaternions[index] = orientation_filter.updateMARG(
                 quaternions[index - 1], gyro_rad_s[index], accel_g[index], mag_ut[index],
                 dt=float(dt[index]))
+        else:
+            quaternions[index] = orientation_filter.updateIMU(
+                quaternions[index - 1], gyro_rad_s[index], accel_g[index], dt=float(dt[index]))
     return quaternions
 
 
@@ -182,20 +202,20 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        timestamps_ms, raw_accel_g, raw_gyro_dps, raw_mag_ut = load_recording(args.input)
+        timestamps_ms, raw_accel_g, raw_gyro_dps, raw_mag_ut, mag_fresh = load_recording(args.input)
         accel_bias, gyro_bias = load_calibration(args.calibration)
-        time_s, dt = sample_intervals(timestamps_ms, default_dt=0.02)
+        time_s, dt = sample_intervals(timestamps_ms, default_dt=0.01)
         corrected_accel_g = raw_accel_g - accel_bias
         corrected_gyro_dps = raw_gyro_dps - gyro_bias
         filter_mag_ut = raw_mag_ut.copy()
         if args.flip_mag_xz:
             filter_mag_ut[:, (0, 2)] *= -1.0
         quaternions = estimate_orientation(args.algorithm, corrected_accel_g,
-                                           corrected_gyro_dps, filter_mag_ut, dt)
+                                           corrected_gyro_dps, filter_mag_ut, mag_fresh, dt)
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
 
-    print(f"Processed {len(time_s)} valid samples; median period is {np.median(dt) * 1000:.2f} ms",
+    print(f"Processed {len(time_s)} valid samples ({mag_fresh.sum()} fresh mag); median period is {np.median(dt) * 1000:.2f} ms",
           file=sys.stderr)
     plot_results(time_s, raw_accel_g, raw_gyro_dps, raw_mag_ut,
                  quaternion_to_world_axes(quaternions), args.algorithm,

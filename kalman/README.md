@@ -57,7 +57,7 @@ All endpoints use port `80` and allow cross-origin requests.
 | Endpoint | Format | Contents |
 | --- | --- | --- |
 | `/stream` | MJPEG multipart | VGA JPEG camera frames |
-| `/imu/stream` | Server-sent events | 50 Hz JSON acceleration, gyro, and magnetometer samples |
+| `/imu/stream` | Server-sent events | 100 Hz JSON acceleration and gyro samples; magnetometer updates at its sensor ODR |
 | `/uwb/stream` | Server-sent events | Parsed UWB anchor ranges with SSE keepalives |
 
 `/stream` is available only in the `atoms3r-m12` environment.
