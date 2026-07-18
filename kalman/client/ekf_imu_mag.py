@@ -20,7 +20,7 @@ class MagGyroCalibrationEKF:
     Based on Han et al (2017) https://doi.org/10.1109/JSEN.2016.2624821
     """
 
-    def __init__(self, dt, h_p0, sigma_m=0.5, sigma_g=np.radians(0.1), phi=10):
+    def __init__(self, dt: float, h_p0, sigma_m: float = 0.5, sigma_g: float = np.radians(0.1), phi: float = 10.0):
         self.dt = dt
         self.phi = phi
         self.sigma_m = sigma_m

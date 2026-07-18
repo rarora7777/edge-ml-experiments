@@ -131,7 +131,7 @@ def estimate_orientation(algorithm: str, accel_g: np.ndarray, gyro_dps: np.ndarr
 
     for index in range(1, len(accel_g)):
         if isinstance(orientation_filter, EKF):
-            orientation_filter.mag = mag_ut[index] if mag_fresh[index] else None
+            orientation_filter.mag = mag_ut[index] if mag_fresh[index] else None # type: ignore
             if mag_fresh[index]:
                 quaternions[index] = orientation_filter.update(
                     quaternions[index - 1], gyro_rad_s[index], accel_g[index],
